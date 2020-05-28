@@ -18,6 +18,7 @@ impl Pid {
     pub fn print_pids(pids: &Vec<Pid>) {
         println!("");
         println!("PIDs:");
+        println!("-----");
         for pid in pids {
             println!("{}, {:2.2}%", pid, (pid.count as f64 / pids.len() as f64) * 100f64);
         }

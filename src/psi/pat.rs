@@ -4,11 +4,20 @@ use byteorder::{ByteOrder, BigEndian};
 use crate::packet;
 
 const PAT_TABLE_ID: u8 = 0x0;
-const PROGRAM_INFO_START_INDEX: u16 = 8;
+/// Start index of the variable section of the payload
+/// ex. for(i=0;i<N;i++) { ... }
+const VARIABLE_SEC_START_INDEX: u16 = 8;
+
+#[derive(Debug, PartialEq)]
+pub enum ProgramInfoType {
+    Network,
+    ProgramMap,
+}
 
 #[derive(Debug)]
 pub struct ProgramInfo {
     program_number: u16,
+    program_info_type: ProgramInfoType,
     pid: u16,
 }
 
@@ -21,40 +30,51 @@ pub struct Pat {
     current_next_indicator: bool,
     section_number: u8,
     last_section_number: u8,
-    program_info: Vec<ProgramInfo>,
+    pub program_info: Vec<ProgramInfo>,
+    pub crc: u32,
 }
 
 impl fmt::Display for Pat {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut program_str = String::new();
         for p in &self.program_info {
-            if p.program_number != 0 {
+            if p.program_info_type == ProgramInfoType::ProgramMap {
                 write!(&mut program_str,
-                    "\t\t=> Program num: {:#4X}, Program map PID: {:#4X}\n", p.program_number, p.pid).unwrap();
+                    "\n\t=> Program num: {:#4X}, Program map PID: {:#4X}", p.program_number, p.pid).unwrap();
             } else {
                 write!(&mut program_str, " => Network PID, not a program").unwrap();
             }
         }
-        write!(f, "\tPAT | Tranport Stream ID: {:#4X}, Version: {:#2X}\n{}",
-            self.transport_stream_id, self.version_number, program_str)
+        write!(f, "[PAT] Tranport Stream ID: {:#4X}, Version: {:#2X}, Crc: {:#4X} {}",
+            self.transport_stream_id, self.version_number, self.crc, program_str)
     }
 }
 
 impl Pat {
     pub fn new(buf: &[u8]) -> Option<Pat> {
         if buf.len() != packet::PAYLOAD_SIZE || buf[0] != PAT_TABLE_ID {
-            println!("Payload len: {}", buf.len());
             return None;
         }
+        // Calculate length and index fields
         let section_length = BigEndian::read_u16(&[buf[1] & 0x0F, buf[2]]);
-        let program_info_end = (2 + section_length) - (packet::CRC_SIZE as u16 - 1);
+        let section_end_index = super::PSI_SEC_START_INDEX + section_length - 1;
+        let variable_section_end_index = section_end_index - (packet::CRC_SIZE as u16);
+
+        let mut variable_index = VARIABLE_SEC_START_INDEX;
         let mut prog_infos: Vec<ProgramInfo> = vec![];
-        for i in PROGRAM_INFO_START_INDEX..program_info_end {
-            let x = i as usize;
+        while variable_index <= variable_section_end_index {
+            let x = variable_index as usize;
+            let program_number = BigEndian::read_u16(&[buf[x], buf[x+1]]);
             prog_infos.push(ProgramInfo {
-                program_number: BigEndian::read_u16(&[buf[x], buf[x+1]]),
+                program_number: program_number,
+                program_info_type: if program_number == 0 {
+                    ProgramInfoType::Network
+                } else {
+                    ProgramInfoType::ProgramMap
+                },
                 pid: BigEndian::read_u16(&[buf[x+2] & 0x1F, buf[x+3]]),
             });
+            variable_index += 4;
         }
 
         Some(Pat {
@@ -66,39 +86,27 @@ impl Pat {
             section_number: buf[6],
             last_section_number: buf[7],
             program_info: prog_infos,
+            crc: BigEndian::read_u32(&buf[(variable_section_end_index as usize)+1..=(section_end_index as usize)]),
         })
     }
 
-    // pub fn display_pat(pk: &[u8], last_crc: &mut u32) {
-    //     let sec = &pk[5..];
-    //     let table_id = sec[0];
-    //     if Pid::get_packet_pid(&pk) != PAT_PID || table_id != PAT_TID {
-    //         return;
-    //     }
-    //     // Get section info
-    //     let section_length = BigEndian::read_u16(&[sec[1] & 0x0F, sec[2]]);
-    //     let section_end = 2 + section_length;
-    //     let crc = BigEndian::read_u32(&sec[(section_end as usize - 3)..=section_end as usize]);
-    //     *last_crc = if crc == *last_crc { return } else { crc };
-    //     // Get PAT data
-    //     let transport_stream_id = BigEndian::read_u16(&[sec[3], sec[4]]);
-    //     let version_num = (sec[5] & 0x3E) >> 1;
+    /// Get a list of PMT PIDs in this PAT packet
+    pub fn get_pmt_pids(&self) -> Vec<crate::Pid> {
+        let mut p: Vec<crate::Pid> = vec![];
+        for i in &self.program_info {
+            if i.program_info_type == ProgramInfoType::ProgramMap {
+                p.push(crate::Pid {value: i.pid, count: 1});
+            }
+        }
+        p
+    }
 
-    //     println!("Table ID: {:#2X}, Tranport Stream ID: {:#4X}, Version: {:#2X}",
-    //         table_id, transport_stream_id, version_num);
-    //     // Get program data
-    //     let mut i = 8u16;
-    //     let program_section_end = (section_length - PAT_SECTION_SCALAR) + i;
-    //     while i < program_section_end {
-    //         let j = i as usize;
-    //         let program_num = BigEndian::read_u16(&[sec[j], sec[j+1]]);
-    //         if program_num != 0 {
-    //             let program_map_pid = BigEndian::read_u16(&[sec[j+2] & 0x1F, sec[j+3]]);
-    //             println!(" => Program num: {:#4X}, Program map PID: {:#4X}", program_num, program_map_pid);
-    //         } else {
-    //             println!(" => Network PID, not a program");
-    //         }
-    //         i += 4;
-    //     }
-    // }
+    /// Print out PAT info. Only display each PAT once
+    pub fn display(&self, last_crc: &mut u32) {
+        // Only print it if the PAT has changed
+        if self.crc != *last_crc {
+            println!("{}", self);
+            *last_crc = self.crc;
+        }
+    }
 }
