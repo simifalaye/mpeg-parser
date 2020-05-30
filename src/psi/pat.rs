@@ -3,10 +3,8 @@ use std::fmt::Write;
 use byteorder::{ByteOrder, BigEndian};
 use crate::packet;
 
+// Constants
 const PAT_TABLE_ID: u8 = 0x0;
-/// Start index of the variable section of the payload
-/// ex. for(i=0;i<N;i++) { ... }
-const VARIABLE_SEC_START_INDEX: u16 = 8;
 
 #[derive(Debug, PartialEq)]
 pub enum ProgramInfoType {
@@ -40,13 +38,14 @@ impl fmt::Display for Pat {
         for p in &self.program_info {
             if p.program_info_type == ProgramInfoType::ProgramMap {
                 write!(&mut program_str,
-                    "\n\t=> Program num: {:#4X}, Program map PID: {:#4X}", p.program_number, p.pid).unwrap();
+                    "\n\t=> Program num: {0:#X}, Program map PID: {1:#X} ({1})",
+                    p.program_number, p.pid).unwrap();
             } else {
-                write!(&mut program_str, " => Network PID, not a program").unwrap();
+                write!(&mut program_str, "\n\t=> Network PID, not a program").unwrap();
             }
         }
-        write!(f, "[PAT] Tranport Stream ID: {:#4X}, Version: {:#2X}, Crc: {:#4X} {}",
-            self.transport_stream_id, self.version_number, self.crc, program_str)
+        write!(f, "[PAT] Tranport Stream ID: {0:#X} ({}), Version: {1:#X}{2}",
+            self.transport_stream_id, self.version_number, program_str)
     }
 }
 
@@ -57,14 +56,14 @@ impl Pat {
         }
         // Calculate length and index fields
         let section_length = BigEndian::read_u16(&[buf[1] & 0x0F, buf[2]]);
-        let section_end_index = super::PSI_SEC_START_INDEX + section_length - 1;
-        let variable_section_end_index = section_end_index - (packet::CRC_SIZE as u16);
+        let section_end = (super::PSI_SEC_START_INDEX + section_length) as usize;
 
-        let mut variable_index = VARIABLE_SEC_START_INDEX;
+        // Get program info
+        let mut n = 8;
+        let end_n = section_end - packet::CRC_SIZE;
         let mut prog_infos: Vec<ProgramInfo> = vec![];
-        while variable_index <= variable_section_end_index {
-            let x = variable_index as usize;
-            let program_number = BigEndian::read_u16(&[buf[x], buf[x+1]]);
+        while n < end_n {
+            let program_number = BigEndian::read_u16(&[buf[n], buf[n+1]]);
             prog_infos.push(ProgramInfo {
                 program_number: program_number,
                 program_info_type: if program_number == 0 {
@@ -72,9 +71,9 @@ impl Pat {
                 } else {
                     ProgramInfoType::ProgramMap
                 },
-                pid: BigEndian::read_u16(&[buf[x+2] & 0x1F, buf[x+3]]),
+                pid: BigEndian::read_u16(&[buf[n+2] & 0x1F, buf[n+3]]),
             });
-            variable_index += 4;
+            n += 4;
         }
 
         Some(Pat {
@@ -86,7 +85,7 @@ impl Pat {
             section_number: buf[6],
             last_section_number: buf[7],
             program_info: prog_infos,
-            crc: BigEndian::read_u32(&buf[(variable_section_end_index as usize)+1..=(section_end_index as usize)]),
+            crc: BigEndian::read_u32(&buf[end_n..=section_end]),
         })
     }
 
