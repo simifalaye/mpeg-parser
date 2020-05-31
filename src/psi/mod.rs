@@ -1,5 +1,6 @@
 use std::fmt;
-use crate::packet;
+use std::collections::HashSet;
+
 pub mod pat;
 pub mod pmt;
 
@@ -7,6 +8,7 @@ pub mod pmt;
 /// The index starting immediately following "section_length" field
 const PSI_SEC_START_INDEX: u16 = 3;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Psi {
     Pat(pat::Pat),
     Pmt(pmt::Pmt),
@@ -22,72 +24,65 @@ impl fmt::Display for Psi {
 }
 
 impl Psi {
-    pub fn new(buf: &[u8], pid: &u16, pmt_pids: &mut Vec<crate::Pid>) -> Option<Psi> {
+    /// Parse a buffer into a Psi object
+    pub fn new(buf: &[u8], pid: &u16, pmt_pids: &HashSet<u16>) -> Option<Psi> {
         // generate the PSI struct according to the pid value
         match pid {
             x if Psi::is_pat(&x) => {
-                if let Some(pt) = Psi::parse_pat(&buf) {
-                    if let Psi::Pat(p) = pt {
-                        // Get the PMT pids from the packet and add the new ones to the list
-                        let pids = p.get_pmt_pids();
-                        for p in pids {
-                            match pmt_pids.binary_search_by(|x| x.value.cmp(&p.value)) {
-                                Ok(pos) => pmt_pids[pos].count += 1,
-                                Err(pos) => pmt_pids.insert(pos, p),
-                            }
-                        }
-                        return Some(Psi::Pat(p));
-                    }
+                match pat::Pat::new(&buf) {
+                    Some(p) => {
+                        Some(Psi::Pat(p))
+                    },
+                    None => None,
                 }
-                None
-
             },
-            x if Psi::is_network_program_elementary(&x) => {
-                // a PMT packet MUST be in the list of pids provided by the PATs
-                if Psi::is_pmt(&x, &pmt_pids) {
-                    return Psi::parse_pmt(&buf);
+            x if Psi::is_pmt(&x, &pmt_pids) => {
+                match pmt::Pmt::new(&buf) {
+                    Some(p) => {
+                        Some(Psi::Pmt(p))
+                    },
+                    None => None,
                 }
-                None
             },
             _ => None,
         }
     }
 
-    /// Checks if a PID is a PAT
+    pub fn get_crc(&self) -> u32 {
+        match &*self {
+            Psi::Pat(p) => p.crc,
+            Psi::Pmt(p) => p.crc,
+        }
+    }
+
+    pub fn get_crc_error(&self) -> bool {
+        match &*self {
+            Psi::Pat(p) => p.crc_error,
+            Psi::Pmt(p) => p.crc_error,
+        }
+    }
+
+    pub fn display(&self, prev_crc: u32) {
+        if self.get_crc() != prev_crc {
+            match &*self {
+                Psi::Pat(p) => println!("{}", p),
+                Psi::Pmt(p) => println!("{}", p),
+            }
+        }
+    }
+
     pub fn is_pat(pid: &u16) -> bool { *pid == 0x0 }
-    /// Checks if a PID is a Network, Program map, or Elementary
     pub fn is_network_program_elementary(pid: &u16) -> bool { *pid >= 0x0010 && *pid <= 0x1FFE }
-    /// Checks if a PID is a PMT
-    fn is_pmt(pid: &u16, pids: &Vec<crate::Pid>) -> bool {
-        match pids.binary_search_by(|x| x.value.cmp(pid)) {
-            Ok(_) => true,
-            Err(_) => false,
-        }
-    }
-
-    /// Parse a PAT buffer into an Option<Psi>
-    fn parse_pat(buf: &[u8]) -> Option<Psi> {
-        match pat::Pat::new(&buf[packet::HEADER_SIZE..]) {
-            Some(p) => {
-                Some(Psi::Pat(p))
-            },
-            None => None,
-        }
-    }
-
-    /// Parse a PMT buffer into an Option<Psi>
-    fn parse_pmt(buf: &[u8]) -> Option<Psi> {
-        match pmt::Pmt::new(&buf[packet::HEADER_SIZE..]) {
-            Some(p) => {
-                Some(Psi::Pmt(p))
-            },
-            None => None,
-        }
+    fn is_pmt(pid: &u16, pmt_pids: &HashSet<u16>) -> bool {
+        if Psi::is_network_program_elementary(&pid) &&
+            pmt_pids.contains(&pid) {
+            true
+        } else { false }
     }
 }
 
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ElementaryStream {
     stream_type: u8,
     elementary_pid: u16,
@@ -125,7 +120,7 @@ impl ElementaryStream {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VideoStreamDescriptor {
     tag: u8,
     length: u8,

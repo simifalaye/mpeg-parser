@@ -1,32 +1,35 @@
-use std::fmt;
-use byteorder::{ByteOrder, BigEndian};
+use std::collections::HashMap;
 
+pub mod mpeg32_crc;
 pub mod packet;
 pub mod psi;
 
-#[derive(Debug)]
-pub struct Pid {
-    pub value: u16,
-    pub count: u32,
+#[derive(Copy, Clone, Debug, Default)]
+pub struct PidErrors {
+    pub cc_errors: u32,
+    pub crc_errors: u32,
 }
 
-impl Pid {
-    pub fn get_packet_pid(buffer: &[u8]) -> u16 {
-        return BigEndian::read_u16(&[buffer[1] & 0x1F, buffer[2]]);
-    }
+#[derive(Debug, Default)]
+pub struct PidState {
+    pub count: u32,
+    pub duplicate_count: u32,
+    pub prev_packet: packet::Packet,
+    pub errors: PidErrors,
+}
 
-    pub fn print_pids(pids: &Vec<Pid>) {
+impl PidState {
+    /// Print out all the Pids and there states
+    pub fn display_states(states: &HashMap<u16, PidState>) {
+        let total_count: u32 = states.iter().map(|(_,s)| s.count).sum();
         println!("");
         println!("PIDs:");
         println!("-----");
-        for pid in pids {
-            println!("{}, {:2.2}%", pid, (pid.count as f64 / pids.len() as f64) * 100f64);
+        for (pid, state) in states.iter() {
+            println!("[PID] {}, Count: {} ({:2.2}%)", pid, state.count,
+                (state.count as f64 / total_count as f64) * 100f64);
+            println!("\t=> Continuity errors: {}, Crc errors: {}",
+                state.errors.cc_errors, state.errors.crc_errors);
         }
-    }
-}
-
-impl fmt::Display for Pid {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "PID {0:#7X}: {0:4}; count: {1:7}", self.value, self.count)
     }
 }

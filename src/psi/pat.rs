@@ -1,25 +1,26 @@
 use std::fmt;
 use std::fmt::Write;
+use std::collections::HashSet;
 use byteorder::{ByteOrder, BigEndian};
-use crate::packet;
+use crate::{packet, mpeg32_crc};
 
 // Constants
 const PAT_TABLE_ID: u8 = 0x0;
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProgramInfoType {
     Network,
     ProgramMap,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramInfo {
     program_number: u16,
     program_info_type: ProgramInfoType,
     pid: u16,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Pat {
     syntax_section_indicator: bool,
     section_length: u16,
@@ -30,9 +31,11 @@ pub struct Pat {
     last_section_number: u8,
     pub program_info: Vec<ProgramInfo>,
     pub crc: u32,
+    pub crc_error: bool,
 }
 
 impl fmt::Display for Pat {
+    /// Display the pmt object along with all program info
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut program_str = String::new();
         for p in &self.program_info {
@@ -50,8 +53,9 @@ impl fmt::Display for Pat {
 }
 
 impl Pat {
+    /// Parse a data_byte buffer into a Pat object and return Option<Pat>
     pub fn new(buf: &[u8]) -> Option<Pat> {
-        if buf.len() != packet::PAYLOAD_SIZE || buf[0] != PAT_TABLE_ID {
+        if buf.len() == 0 || buf[0] != PAT_TABLE_ID {
             return None;
         }
         // Calculate length and index fields
@@ -76,6 +80,8 @@ impl Pat {
             n += 4;
         }
 
+        let crc = BigEndian::read_u32(&buf[end_n..=section_end]);
+        let exp_crc = mpeg32_crc::crc32_mpeg(&buf[0..end_n]);
         Some(Pat {
             syntax_section_indicator: packet::get_bit_at(buf[1], 7),
             section_length: section_length,
@@ -85,27 +91,19 @@ impl Pat {
             section_number: buf[6],
             last_section_number: buf[7],
             program_info: prog_infos,
-            crc: BigEndian::read_u32(&buf[end_n..=section_end]),
+            crc: crc,
+            crc_error: crc != exp_crc,
         })
     }
 
     /// Get a list of PMT PIDs in this PAT packet
-    pub fn get_pmt_pids(&self) -> Vec<crate::Pid> {
-        let mut p: Vec<crate::Pid> = vec![];
+    pub fn get_pmt_pids(&self) -> HashSet<u16> {
+        let mut p: HashSet<u16> = HashSet::new();
         for i in &self.program_info {
             if i.program_info_type == ProgramInfoType::ProgramMap {
-                p.push(crate::Pid {value: i.pid, count: 1});
+                p.insert(i.pid);
             }
         }
         p
-    }
-
-    /// Print out PAT info. Only display each PAT once
-    pub fn display(&self, last_crc: &mut u32) {
-        // Only print it if the PAT has changed
-        if self.crc != *last_crc {
-            println!("{}", self);
-            *last_crc = self.crc;
-        }
     }
 }

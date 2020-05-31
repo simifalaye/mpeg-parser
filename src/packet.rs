@@ -2,61 +2,170 @@ use std::{
     fmt,
     fs::File,
     io::{SeekFrom, prelude::*},
+    collections::HashMap,
+    collections::HashSet,
 };
 use byteorder::{ByteOrder, BigEndian};
-use crate::psi;
+use crate::psi::*;
 
 // Constants
 pub const SYNC_BYTE_VAL: u8 = 0x47;
 pub const PACKET_SIZE: usize = 188;
-pub const HEADER_SIZE: usize = 5;
+pub const HEADER_SIZE: usize = 4;
 pub const CRC_SIZE: usize = 4;
-pub const PAYLOAD_SIZE: usize = PACKET_SIZE - HEADER_SIZE;
 
-#[allow(dead_code)]
+#[derive(Clone, Debug)]
 pub struct Packet {
     transport_error_indicator: bool,
     payload_unit_start_indicator: bool,
-    transport_priority: bool,
+    pub transport_priority: bool,
     pub pid: u16,
-    transport_scrambling_control: u8,
-    adaptation_field_control: u8,
-    continuity_counter: u8,
-    pub psi: Option<psi::Psi>,
-    // TODO: Implement adaptation fields
+    pub transport_scrambling_control: u8,
+    pub adaptation_field_control: u8,
+    pub continuity_counter: u8,
+    // TODO: Possibly implement adaptation_field, for now ignore
+    pub payload: Vec<u8>,
 }
 
 impl fmt::Display for Packet {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mut psi_str = String::from("\t=> No psi info!");
-        if let Some(p) = &self.psi {
-            psi_str = format!("\t{}", p);
+        write!(f, "[TS] PID {0:#7X}: {0:4}; Transport-error: {1}; Continuity: {2}",
+            self.pid, self.transport_error_indicator, self.continuity_counter)
+    }
+}
+
+impl PartialEq for Packet {
+    fn eq(&self, other: &Self) -> bool {
+        self.transport_error_indicator == other.transport_error_indicator &&
+            self.payload_unit_start_indicator == other.payload_unit_start_indicator &&
+            self.transport_priority == other.transport_priority &&
+            self.pid == other.pid &&
+            self.transport_scrambling_control == other.transport_scrambling_control &&
+            self.adaptation_field_control == other.adaptation_field_control &&
+            self.continuity_counter == other.continuity_counter
+    }
+}
+impl Eq for Packet {}
+
+impl Default for Packet {
+    fn default() -> Self {
+        Packet {
+            transport_error_indicator: false,
+            payload_unit_start_indicator: false,
+            transport_priority: false,
+            pid: 0,
+            transport_scrambling_control: 0,
+            adaptation_field_control: 0,
+            continuity_counter: 0,
+            payload: Vec::default(),
         }
-        write!(f, "[TS] PID {0:#7X}: {0:4}; Transport-error: {1}; Continuity: {2}\n{3}",
-            self.pid, self.transport_error_indicator, self.continuity_counter, psi_str)
     }
 }
 
 impl Packet {
-    pub fn new(buf: &[u8], pmt_pids: &mut Vec<crate::Pid>) -> Option<Packet> {
+    /// Parse a packet buffer into a Packet object and return it as Option<Packet>
+    pub fn new(buf: &[u8]) -> Option<Packet> {
         if buf.len() != PACKET_SIZE || buf[0] != SYNC_BYTE_VAL{
             return None;
         }
 
         let pid = BigEndian::read_u16(&[buf[1] & 0x1F, buf[2]]);
-        let psi = psi::Psi::new(&buf, &pid, pmt_pids);
+        let adaptation_field_control = (buf[3] & 0x30) >> 4;
+        let adaptation_field_len = buf[4] as usize;
+        // A payload only exits in the packet if the adaptation_field_control indicates so
+        let payload = if adaptation_field_control == 0x1 {
+            buf[(HEADER_SIZE+1)..].to_vec()
+        } else if adaptation_field_control == 0x3 {
+            buf[(HEADER_SIZE+adaptation_field_len+2)..].to_vec()
+        } else {
+            vec![]
+        };
+
         Some(Packet {
             transport_error_indicator: get_bit_at(buf[1], 7),
             payload_unit_start_indicator: get_bit_at(buf[1], 6),
             transport_priority: get_bit_at(buf[1], 5),
             pid: pid,
             transport_scrambling_control: (buf[3] & 0xC0) >> 6,
-            adaptation_field_control: (buf[3] & 0x30) >> 4,
+            adaptation_field_control: adaptation_field_control,
             continuity_counter: buf[3] & 0x0F,
-            psi: psi,
+            payload: payload,
         })
     }
 
+    /// Update the counts and errors of a PidState object for a given packet
+    pub fn update_state(&self, pid_states: &mut HashMap<u16, crate::PidState>,
+        pmt_pids: &mut HashSet<u16>) {
+        let mut created = false;
+        // Get or create the state
+        let state: Option<&mut crate::PidState> =
+            match pid_states.get_mut(&self.pid) {
+            Some(s) => Some(s),
+            None => {
+                pid_states.insert(self.pid, crate::PidState {
+                    count: 0,
+                    duplicate_count: 0,
+                    prev_packet: self.clone(),
+                    errors: Default::default(),
+                });
+                created = true;
+                pid_states.get_mut(&self.pid)
+            },
+        };
+
+        if let Some(s) = state {
+            // Update
+            let is_dup = *self == s.prev_packet;
+            let last_cc = s.prev_packet.continuity_counter;
+            s.count += 1;
+            s.duplicate_count = if is_dup { s.duplicate_count + 1 } else { 0 };
+
+            // Check for continuity errors
+            if !created && self.has_continuity_error(last_cc, s.duplicate_count, is_dup) {
+                s.errors.cc_errors += 1;
+            }
+
+            // Handle packet if it is a psi packet
+            if let Some(psi) = Psi::new(self.payload.as_slice(), &self.pid, &pmt_pids) {
+                self.update_pmt_pids(&psi, pmt_pids);
+                // Display psi info (Only if it is new according to its crc)
+                if let Some(old_psi) = Psi::new(s.prev_packet.payload.as_slice(),
+                    &self.pid, &pmt_pids) {
+                    let prev_crc = if !created { old_psi.get_crc() } else { 0 };
+                    psi.display(prev_crc);
+                }
+
+                // Check for crc errors
+                if psi.get_crc_error() {
+                    s.errors.crc_errors += 1;
+                }
+            }
+
+            // Set the previous packet
+            s.prev_packet = self.clone();
+        }
+    }
+
+    /// Update a Vector of PIDs with the PMT PIDs found a given PAT packet.
+    /// If the packet is not a pat, the pmt list won't be touched
+    fn update_pmt_pids(&self, psi: &Psi, pmt_pids: &mut HashSet<u16>) {
+        if let Psi::Pat(pat) = psi {
+            // Add the new pmt pids into our list
+            let new_pmt_pids = pat.get_pmt_pids();
+            pmt_pids.extend(&new_pmt_pids);
+        }
+    }
+
+    fn has_continuity_error(&self, last_cc: u8, dup_count: u32, is_dup: bool) -> bool {
+        let next_cc = if last_cc == 15 { 0 } else { last_cc + 1};
+        if self.continuity_counter != next_cc {
+            if !(self.adaptation_field_control == 0x0 || self.adaptation_field_control == 0x2) &&
+                !(is_dup && dup_count < 2) {
+                    return true;
+            }
+        }
+        false
+    }
 }
 
 /// Moves file pointer to sync byte of a transport stream file

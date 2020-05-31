@@ -2,9 +2,9 @@ use std::{
     fs::File,
     io::prelude::*,
     collections::HashMap,
+    collections::HashSet,
 };
-use mpeg_parser::*;
-use mpeg_parser::psi::*;
+use mpeg_parser::{PidState, packet::*};
 
 // Usage:
 // mpeg-parser <filename>
@@ -24,17 +24,16 @@ fn main() {
     };
 
     // Move the file pointer to the sync byte
-    if !packet::advance_file_to_sync_byte(&mut file) {
+    if !advance_file_to_sync_byte(&mut file) {
         eprintln!("Unable to find sync byte in file: {}", filename);
         std::process::exit(1);
     }
 
-    let mut buffer = [0u8; packet::PACKET_SIZE * 1024];
-    let mut pmt_pids: Vec<Pid> = vec![];
-    let mut pat_crc = 0u32;
-    let mut pmt_crcs: HashMap<u16, u32> = HashMap::new();
-    println!("PSIs:");
-    println!("-----");
+    // State variables
+    let mut buffer = [0u8; PACKET_SIZE * 1024];
+    let mut pmt_pids: HashSet<u16> = HashSet::new();
+    let mut pid_states: HashMap<u16, PidState> = HashMap::new();
+
     'file: loop {
         // Read file in chunks (more efficient to read in larger chunks)
         match file.read(&mut buffer[..]).expect("read failed") {
@@ -42,22 +41,17 @@ fn main() {
             0 => break,
             _n => {
                 // iterate through buffer by the packet size
-                let mut itr = buffer.chunks_exact(packet::PACKET_SIZE);
+                let mut itr = buffer.chunks_exact(PACKET_SIZE);
                 let mut pk = match itr.next() {
                     None => break 'file,
                     p => p.unwrap(),
                 };
 
                 'packet: loop {
-                    // try to parse the buffer as a packet
-                    if let Some(packet) = packet::Packet::new(pk, &mut pmt_pids) {
-                        // if the packet is a psi packet, display it (only prints each unique psi)
-                        if let Some(psi) = packet.psi {
-                            match psi {
-                                Psi::Pat(pat) => pat.display(&mut pat_crc),
-                                Psi::Pmt(pmt) => pmt.display(&packet.pid, &mut pmt_crcs),
-                            }
-                        }
+                    if let Some(packet) = Packet::new(pk) {
+                        // Update state and errors
+                        packet.update_state(&mut pid_states, &mut pmt_pids);
+
                         // iterate to next packet
                         pk = match itr.next() {
                             None => break 'packet,
@@ -68,6 +62,8 @@ fn main() {
             },
         }
     }
+    // Print pids
+    PidState::display_states(&pid_states);
 
     // Return
     std::process::exit(0);

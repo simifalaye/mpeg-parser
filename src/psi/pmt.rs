@@ -1,14 +1,13 @@
 use std::fmt;
 use std::fmt::Write;
-use std::collections::HashMap;
 use byteorder::{ByteOrder, BigEndian};
 use super::{VideoStreamDescriptor,ElementaryStream};
-use crate::packet;
+use crate::{packet, mpeg32_crc};
 
 // Constants
 const PMT_TABLE_ID: u8 = 0x02;
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Pmt {
     section_syntax_indicator: bool,
     program_number: u16,
@@ -21,9 +20,11 @@ pub struct Pmt {
     pub descriptors: Vec<VideoStreamDescriptor>,
     pub elementary_streams: Vec<ElementaryStream>,
     pub crc: u32,
+    pub crc_error: bool,
 }
 
 impl fmt::Display for Pmt {
+    /// Display the pmt along with all descriptors and elementary streams
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut des_str = String::new();
         let mut elem_str = String::new();
@@ -50,8 +51,9 @@ impl fmt::Display for Pmt {
 }
 
 impl Pmt {
+    /// Parse a data_byte buffer into a Pmt object and return Option<Pmt>
     pub fn new(buf: &[u8]) -> Option<Pmt> {
-        if buf.len() != packet::PAYLOAD_SIZE || buf[0] != PMT_TABLE_ID {
+        if buf.len() == 0 || buf[0] != PMT_TABLE_ID {
             return None;
         }
         // Calculate length and index fields
@@ -103,6 +105,8 @@ impl Pmt {
             n1 = end_n2;
         }
 
+        let crc = BigEndian::read_u32(&buf[end_n1..=section_end]);
+        let exp_crc = mpeg32_crc::crc32_mpeg(&buf[0..end_n1]);
         Some(Pmt {
             section_syntax_indicator: packet::get_bit_at(buf[1], 7),
             program_number: BigEndian::read_u16(&[buf[3], buf[4]]),
@@ -114,22 +118,8 @@ impl Pmt {
             program_info_length: program_info_length,
             descriptors: descriptors,
             elementary_streams: elementary_streams,
-            crc: BigEndian::read_u32(&buf[end_n1..=section_end]),
+            crc: crc,
+            crc_error: crc != exp_crc,
         })
-    }
-
-    /// Print out PMT info. Only display each PMT once
-    pub fn display(&self, pid: &u16, crc_map: &mut HashMap<u16, u32>) {
-        // If this PID has been seen before, then..., else note that we have seen it and display it
-        if let Some(last_crc) = crc_map.get_mut(pid) {
-            // If this PMT has changed, then display it, else ignore it
-            if self.crc != *last_crc {
-                *last_crc = self.crc;
-                println!("{}", self);
-            }
-        } else {
-            crc_map.insert(*pid, self.crc);
-            println!("{}", self);
-        }
     }
 }
