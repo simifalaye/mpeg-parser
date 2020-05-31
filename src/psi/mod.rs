@@ -28,22 +28,8 @@ impl Psi {
     pub fn new(buf: &[u8], pid: &u16, pmt_pids: &HashSet<u16>) -> Option<Psi> {
         // generate the PSI struct according to the pid value
         match pid {
-            x if Psi::is_pat(&x) => {
-                match pat::Pat::new(&buf) {
-                    Some(p) => {
-                        Some(Psi::Pat(p))
-                    },
-                    None => None,
-                }
-            },
-            x if Psi::is_pmt(&x, &pmt_pids) => {
-                match pmt::Pmt::new(&buf) {
-                    Some(p) => {
-                        Some(Psi::Pmt(p))
-                    },
-                    None => None,
-                }
-            },
+            x if Psi::is_pat(&x) => Some(Psi::Pat(pat::Pat::new(&buf)?)),
+            x if Psi::is_pmt(&x, &pmt_pids) => Some(Psi::Pmt(pmt::Pmt::new(&buf)?)),
             _ => None,
         }
     }

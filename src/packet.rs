@@ -13,6 +13,7 @@ pub const SYNC_BYTE_VAL: u8 = 0x47;
 pub const PACKET_SIZE: usize = 188;
 pub const HEADER_SIZE: usize = 4;
 pub const CRC_SIZE: usize = 4;
+const NULL_PACKET_PID: u16 = 0x1FFF;
 
 #[derive(Clone, Debug)]
 pub struct Packet {
@@ -98,9 +99,9 @@ impl Packet {
         pmt_pids: &mut HashSet<u16>) {
         let mut created = false;
         // Get or create the state
-        let state: Option<&mut crate::PidState> =
+        let s =
             match pid_states.get_mut(&self.pid) {
-            Some(s) => Some(s),
+            Some(state) => state,
             None => {
                 pid_states.insert(self.pid, crate::PidState {
                     count: 0,
@@ -109,41 +110,40 @@ impl Packet {
                     errors: Default::default(),
                 });
                 created = true;
-                pid_states.get_mut(&self.pid)
+                pid_states.get_mut(&self.pid).unwrap()
             },
         };
 
-        if let Some(s) = state {
-            // Update
-            let is_dup = *self == s.prev_packet;
-            let last_cc = s.prev_packet.continuity_counter;
-            s.count += 1;
-            s.duplicate_count = if is_dup { s.duplicate_count + 1 } else { 0 };
+        // Update
+        let is_dup = *self == s.prev_packet;
+        let last_cc = s.prev_packet.continuity_counter;
+        s.count += 1;
+        s.duplicate_count = if is_dup { s.duplicate_count + 1 } else { 0 };
 
-            // Check for continuity errors
-            if !created && self.has_continuity_error(last_cc, s.duplicate_count, is_dup) {
-                s.errors.cc_errors += 1;
-            }
-
-            // Handle packet if it is a psi packet
-            if let Some(psi) = Psi::new(self.payload.as_slice(), &self.pid, &pmt_pids) {
-                self.update_pmt_pids(&psi, pmt_pids);
-                // Display psi info (Only if it is new according to its crc)
-                if let Some(old_psi) = Psi::new(s.prev_packet.payload.as_slice(),
-                    &self.pid, &pmt_pids) {
-                    let prev_crc = if !created { old_psi.get_crc() } else { 0 };
-                    psi.display(prev_crc);
-                }
-
-                // Check for crc errors
-                if psi.get_crc_error() {
-                    s.errors.crc_errors += 1;
-                }
-            }
-
-            // Set the previous packet
-            s.prev_packet = self.clone();
+        // Check for continuity errors
+        if !created && self.pid != NULL_PACKET_PID &&
+            self.has_continuity_error(last_cc, s.duplicate_count, is_dup) {
+            s.errors.cc_errors += 1;
         }
+
+        // Handle packet if it is a psi packet
+        if let Some(psi) = Psi::new(self.payload.as_slice(), &self.pid, &pmt_pids) {
+            self.update_pmt_pids(&psi, pmt_pids);
+            // Display psi info (Only if it is new according to its crc)
+            if let Some(old_psi) = Psi::new(s.prev_packet.payload.as_slice(),
+                &self.pid, &pmt_pids) {
+                let prev_crc = if !created { old_psi.get_crc() } else { 0 };
+                psi.display(prev_crc);
+            }
+
+            // Check for crc errors
+            if psi.get_crc_error() {
+                s.errors.crc_errors += 1;
+            }
+        }
+
+        // Set the previous packet
+        s.prev_packet = self.clone();
     }
 
     /// Update a Vector of PIDs with the PMT PIDs found a given PAT packet.
